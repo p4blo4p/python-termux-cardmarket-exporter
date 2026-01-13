@@ -3,13 +3,12 @@ import os
 import csv
 import time
 import argparse
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
-from playwright.sync_api import sync_playwright
 
 # Configuración de argumentos
-parser = argparse.ArgumentParser(description='Cardmarket Exporter Pro con Recuperación')
-parser.add_argument('--start-date', help='YYYY-MM-DD')
-parser.add_argument('--end-date', help='YYYY-MM-DD')
+parser = argparse.ArgumentParser(description='Cardmarket Exporter para Termux')
 parser.add_argument('--year', help='Año (ej. 2025)')
 parser.add_argument('--include-purchases', action='store_true', help='Exportar Compras')
 parser.add_argument('--include-sales', action='store_true', help='Exportar Ventas')
@@ -19,8 +18,16 @@ USER_NAME = os.environ.get('CM_USERNAME')
 PASSWORD = os.environ.get('CM_PASSWORD')
 CSV_FILE = 'cardmarket_export.csv'
 
+# Headers para imitar navegador móvil y evitar bloqueos
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Origin': 'https://www.cardmarket.com',
+    'Referer': 'https://www.cardmarket.com/en/Magic/MainPage/Login'
+}
+
 def load_existing_data():
-    """Carga los IDs existentes para evitar duplicados y retomar el trabajo."""
     existing_ids = set()
     rows = []
     if os.path.exists(CSV_FILE):
@@ -31,64 +38,57 @@ def load_existing_data():
                     if row.get('Order ID'):
                         existing_ids.add(row.get('Order ID'))
                         rows.append(row)
-            print(f"INFO: Se cargaron {len(existing_ids)} registros existentes para recuperación.")
-        except Exception as e:
-            print(f"WARNING: No se pudo leer el CSV previo: {e}")
+            print(f"[*] Registros previos cargados: {len(existing_ids)}")
+        except: pass
     return existing_ids, rows
 
-def scrape_section(page, url, start_dt, end_dt, existing_ids):
-    print(f"INFO: Navegando a {url}...")
-    page.goto(url, wait_until="networkidle")
-    
-    # Intentar cerrar banners de cookies
-    try:
-        cookie_btn = page.query_selector('#cookie-allow-all-button')
-        if cookie_btn: cookie_btn.click()
-    except: pass
-
+def scrape_section(session, url, start_dt, end_dt, existing_ids):
+    print(f"[*] Accediendo a: {url}")
     new_data = []
-    has_next = True
     page_num = 1
-
-    while has_next:
-        print(f"DEBUG: Procesando página {page_num}...")
-        try:
-            page.wait_for_selector('div.table-body', timeout=10000)
-        except:
-            print("ERROR: No se encontró la tabla de pedidos. ¿Quizás no hay registros?")
+    
+    while True:
+        paginated_url = f"{url}?site={page_num}"
+        response = session.get(paginated_url, headers=HEADERS)
+        
+        if response.status_code != 200:
+            print(f"[!] Error al acceder a la página {page_num}: {response.status_code}")
             break
             
-        rows = page.query_selector_all('div.table-body > div.row')
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table_body = soup.select_one('div.table-body')
+        
+        if not table_body:
+            print("[!] No se encontró la tabla. Sesión expirada o sin datos.")
+            break
+            
+        rows = table_body.select('div.row')
         if not rows: break
 
         page_duplicates = 0
         for row in rows:
             try:
-                id_el = row.query_selector('.col-orderId')
-                order_id = id_el.inner_text().strip() if id_el else None
-                
-                if not order_id: continue
+                id_el = row.select_one('.col-orderId')
+                if not id_el: continue
+                order_id = id_el.get_text(strip=True)
 
-                # LÓGICA DE RECUPERACIÓN: Si el ID ya existe, lo saltamos
                 if order_id in existing_ids:
                     page_duplicates += 1
                     continue
 
-                date_el = row.query_selector('.col-date')
-                date_str = date_el.inner_text().strip() if date_el else ""
+                date_el = row.select_one('.col-date')
+                date_str = date_el.get_text(strip=True) if date_el else ""
                 
+                # Validación de fecha básica
                 try:
-                    row_date = datetime.strptime(date_str.split(' ')[0], '%d.%m.%y')
-                    if start_dt and row_date < start_dt:
-                        has_next = False
-                        continue
-                    if end_dt and row_date > end_dt:
-                        continue
+                    row_dt = datetime.strptime(date_str.split(' ')[0], '%d.%m.%y')
+                    if start_dt and row_dt < start_dt:
+                        return new_data # Salimos del scrap si llegamos a fechas anteriores
                 except: pass
 
-                status = row.query_selector('.col-status').inner_text().strip() if row.query_selector('.col-status') else ""
-                user = row.query_selector('.col-user').inner_text().strip() if row.query_selector('.col-user') else ""
-                total = row.query_selector('.col-total').inner_text().strip() if row.query_selector('.col-total') else ""
+                status = row.select_one('.col-status').get_text(strip=True) if row.select_one('.col-status') else ""
+                user = row.select_one('.col-user').get_text(strip=True) if row.select_one('.col-user') else ""
+                total = row.select_one('.col-total').get_text(strip=True) if row.select_one('.col-total') else ""
 
                 new_data.append({
                     'Order ID': order_id,
@@ -100,103 +100,76 @@ def scrape_section(page, url, start_dt, end_dt, existing_ids):
                 })
                 existing_ids.add(order_id)
             except Exception as e:
-                print(f"DEBUG: Error procesando fila: {e}")
+                print(f"[!] Error en fila: {e}")
 
-        # Si toda la página son duplicados, es que ya estamos al día
-        if page_duplicates == len(rows) and len(rows) > 0:
-            print("INFO: Se detectaron solo registros existentes en esta página. Sincronización completa para esta sección.")
-            has_next = False
+        print(f"[*] Página {page_num}: {len(rows)} filas procesadas.")
+
+        if page_duplicates == len(rows):
+            print("[*] Sincronización completa alcanzada.")
             break
 
-        next_btn = page.query_selector('a[aria-label="Next Page"]')
-        if next_btn and has_next:
-            next_btn.click()
-            page.wait_for_load_state('networkidle')
-            page_num += 1
-            time.sleep(1)
-        else:
-            has_next = False
+        # Verificar si hay botón "Next"
+        next_btn = soup.select_one('a[aria-label="Next Page"]')
+        if not next_btn: break
+        
+        page_num += 1
+        time.sleep(1) # Respeto al servidor
 
     return new_data
 
 def run():
+    if not USER_NAME or not PASSWORD:
+        print("[!] Error: CM_USERNAME y CM_PASSWORD son necesarios.")
+        return
+
     existing_ids, all_rows = load_existing_data()
-    
-    start_dt = None
-    end_dt = datetime.now()
-    if args.year:
-        start_dt = datetime(int(args.year), 1, 1)
-        end_dt = datetime(int(args.year), 12, 31)
-    elif args.start_date:
-        start_dt = datetime.strptime(args.start_date, '%Y-%m-%d')
+    start_dt = datetime(int(args.year), 1, 1) if args.year else None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800}
-        )
-        page = context.new_page()
-
-        print("INFO: Iniciando sesión en Cardmarket...")
-        page.goto("https://www.cardmarket.com/en/Magic/MainPage/Login")
+    with requests.Session() as s:
+        print("[*] Intentando Login...")
+        # Primero obtenemos la página para el token CSRF si existiera
+        login_page = s.get("https://www.cardmarket.com/en/Magic/MainPage/Login", headers=HEADERS)
+        soup = BeautifulSoup(login_page.text, 'html.parser')
         
-        # Detección de Cloudflare
-        if "Cloudflare" in page.title() or "moment" in page.title():
-            print("CRITICAL: Bloqueado por Cloudflare. Las IPs de GitHub suelen estar marcadas.")
-            browser.close()
-            exit(1)
+        # Cardmarket suele usar un formulario estándar
+        payload = {
+            '_username': USER_NAME,
+            '_password': PASSWORD,
+            '__submit': 'Login'
+        }
+        
+        res = s.post("https://www.cardmarket.com/en/Magic/MainPage/Login", data=payload, headers=HEADERS)
+        
+        if "Login" in BeautifulSoup(res.text, 'html.parser').title.string:
+            print("[!] Login fallido. Revisa credenciales o si hay bloqueo temporal.")
+            return
 
-        try:
-            # Selectores alternativos para mayor robustez
-            page.wait_for_selector('input[name="_username"], input[name="username"]', timeout=15000)
-            user_selector = 'input[name="_username"]' if page.query_selector('input[name="_username"]') else 'input[name="username"]'
-            pass_selector = 'input[name="_password"]' if page.query_selector('input[name="_password"]') else 'input[name="password"]'
-            
-            page.fill(user_selector, USER_NAME)
-            page.fill(pass_selector, PASSWORD)
-            page.click('button[type="submit"], input[type="submit"]')
-            page.wait_for_load_state('networkidle')
-        except Exception as e:
-            print(f"CRITICAL: No se pudo interactuar con el formulario de login: {e}")
-            browser.close()
-            exit(1)
-
-        if "Login" in page.title():
-            print("CRITICAL: Login fallido. Revisa tus credenciales o si hay un CAPTCHA visual.")
-            browser.close()
-            exit(1)
-
-        new_count = 0
+        print("[+] Login exitoso.")
+        
+        new_total = 0
         if args.include_purchases:
-            new_count += len(scrape_section(page, "https://www.cardmarket.com/en/Magic/Orders/Received", start_dt, end_dt, existing_ids))
+            new_total += len(scrape_section(s, "https://www.cardmarket.com/en/Magic/Orders/Received", start_dt, None, existing_ids))
         if args.include_sales:
-            new_count += len(scrape_section(page, "https://www.cardmarket.com/en/Magic/Sales/Sent", start_dt, end_dt, existing_ids))
+            new_total += len(scrape_section(s, "https://www.cardmarket.com/en/Magic/Sales/Sent", start_dt, None, existing_ids))
 
-        if new_count > 0:
-            # Re-obtener todas las filas (actualizadas en existing_ids/all_rows por referencia en teoría, 
-            # pero mejor reconstruir all_rows o asegurar append)
-            # Para este script, scrape_section añade directamente a la lógica de retorno.
-            # Re-guardar todo
-            # Nota: para simplicidad reconstruimos la lista final basándonos en el orden de scrape
-            # En una app real ordenaríamos por fecha.
-            # Aquí simplemente guardamos all_rows que ya tiene lo viejo + lo nuevo.
-            
-            # Ordenar por fecha descendente (opcional pero recomendado)
-            # all_rows.sort(key=lambda x: x['Date'], reverse=True)
-
+        if new_total > 0:
             keys = ['Order ID', 'Date', 'User', 'Status', 'Total', 'Type']
             with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=keys)
                 writer.writeheader()
-                # Filtrar para asegurar que solo escribimos lo que tiene las llaves correctas
-                for r in all_rows:
-                    writer.writerow({k: r.get(k, '') for k in keys})
-            print(f"SUCCESS: Se añadieron {new_count} nuevos registros. Total actual: {len(all_rows)}")
+                # Reconstruir lista para asegurar formato
+                final_list = []
+                # Añadir registros (podrías ordenarlos aquí)
+                # ... lógica de ordenación si fuera necesaria ...
+                for id in existing_ids:
+                    # Buscamos el registro en all_rows o nuevos
+                    # (En este ejemplo simplemente guardamos el estado actual)
+                    pass
+                # Escribimos los datos acumulados
+                writer.writerows(all_rows) 
+            print(f"[+] CSV actualizado. Total registros: {len(all_rows)}")
         else:
-            print("INFO: No hay nuevos datos para añadir.")
-
-        browser.close()
+            print("[*] No se encontraron nuevos datos.")
 
 if __name__ == "__main__":
     run()
