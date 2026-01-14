@@ -14,23 +14,29 @@ parser.add_argument('--include-purchases', action='store_true', help='Exportar C
 parser.add_argument('--include-sales', action='store_true', help='Exportar Ventas')
 args = parser.parse_args()
 
-# --- VARIABLES DE ENTORNO (CRÍTICAS) ---
+# --- VARIABLES DE ENTORNO ---
+# MÉTODO 1: Toda la cadena de cookies (RECOMENDADO si el PHPSESSID falla)
+CM_COOKIE = os.environ.get('CM_COOKIE', '').strip()
+# MÉTODO 2: Solo PHPSESSID (A veces insuficiente por Cloudflare)
 CM_PHPSESSID = os.environ.get('CM_PHPSESSID', '').strip()
 
-# El User-Agent es la "huella" de tu navegador. 
-# Si no lo pones, usamos uno genérico que suele fallar.
+# User-Agent (Debe coincidir con el navegador que generó la cookie)
 CM_USER_AGENT = os.environ.get('CM_USER_AGENT', '').strip()
 
 CSV_FILE = 'cardmarket_export.csv'
 
-def get_headers(ua):
-    return {
+def get_headers(ua, cookie_str=None):
+    h = {
         'User-Agent': ua,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
     }
+    if cookie_str:
+        h['Cookie'] = cookie_str
+    return h
 
 def load_existing_data():
     existing_ids = set()
@@ -46,18 +52,19 @@ def load_existing_data():
         except: pass
     return existing_ids, rows
 
-def scrape_section(session, url, start_dt, existing_ids, ua):
+def scrape_section(session, url, start_dt, existing_ids, ua, cookie_str):
     print(f"[*] Accediendo a: {url}")
     new_data = []
     page_num = 1
-    headers = get_headers(ua)
     
     while True:
         paginated_url = f"{url}?site={page_num}"
         try:
+            headers = get_headers(ua, cookie_str)
             response = session.get(paginated_url, headers=headers, timeout=15)
+            
             if 'Logout' not in response.text:
-                print(f"[!] Sesión invalidada en página {page_num}. Cardmarket ha detectado el cambio de navegador.")
+                print(f"[!] Sesión invalidada en página {page_num}. Cardmarket ha rechazado la cookie.")
                 break
 
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -83,7 +90,6 @@ def scrape_section(session, url, start_dt, existing_ids, ua):
                 try:
                     row_dt = datetime.strptime(date_str.split(' ')[0], '%d.%m.%y')
                     if start_dt and row_dt < start_dt:
-                        print(f"[*] Filtro de fecha alcanzado.")
                         return new_data
                 except: pass
 
@@ -98,7 +104,7 @@ def scrape_section(session, url, start_dt, existing_ids, ua):
                 })
                 existing_ids.add(order_id)
 
-            print(f"[*] Página {page_num}: {len(new_data)} nuevos.")
+            print(f"[*] Página {page_num}: {len(new_data)} nuevos pedidos.")
             if page_duplicates == len(rows): break
             if not soup.select_one('a[aria-label="Next Page"]'): break
             page_num += 1
@@ -109,38 +115,43 @@ def scrape_section(session, url, start_dt, existing_ids, ua):
     return new_data
 
 def run():
-    if not CM_PHPSESSID:
-        print("[!] ERROR: No has configurado CM_PHPSESSID.")
+    if not CM_COOKIE and not CM_PHPSESSID:
+        print("[!] ERROR: No has configurado CM_COOKIE o CM_PHPSESSID.")
         return
     
-    ua = CM_USER_AGENT
-    if not ua:
-        ua = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
-        print("[?] ADVERTENCIA: No has puesto CM_USER_AGENT. Usando uno genérico (puede fallar).")
+    ua = CM_USER_AGENT if CM_USER_AGENT else 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
+    
+    # Construir cookie string final
+    final_cookie = CM_COOKIE if CM_COOKIE else f"PHPSESSID={CM_PHPSESSID}"
 
     existing_ids, all_rows = load_existing_data()
     start_dt = datetime(int(args.year), 1, 1) if args.year else None
 
     with requests.Session() as s:
-        s.cookies.set('PHPSESSID', CM_PHPSESSID, domain='.cardmarket.com', path='/')
+        print("[*] Verificando sesión con cabeceras completas...")
+        headers = get_headers(ua, final_cookie)
         
-        print("[*] Verificando sesión...")
-        headers = get_headers(ua)
-        check = s.get("https://www.cardmarket.com/en/Magic", headers=headers, timeout=10)
-        
-        if 'Logout' in check.text:
-            print("[+] SESIÓN ACTIVA. El User-Agent coincide correctamente.")
-        else:
-            print("[!] ERROR: Sesión incorrecta o expirada.")
-            print("[!] RECUERDA: El CM_USER_AGENT en Termux debe ser IDÉNTICO al de tu móvil.")
-            with open('debug_error.html', 'w', encoding='utf-8') as f: f.write(check.text)
+        try:
+            check = s.get("https://www.cardmarket.com/en/Magic", headers=headers, timeout=10)
+            
+            if 'Logout' in check.text:
+                print("[+] SESIÓN ACTIVA. Identidad verificada.")
+            else:
+                print("[!] ERROR: La sesión sigue fallando.")
+                print("[*] Diagnóstico: Guardando 'debug_fail.html'...")
+                with open('debug_fail.html', 'w', encoding='utf-8') as f: f.write(check.text)
+                if "cloudflare" in check.text.lower():
+                    print("[!] BLOQUEO: Cloudflare requiere que copies TODA la cadena de cookies.")
+                return
+        except Exception as e:
+            print(f"[!] Error de red: {e}")
             return
 
         new_items = []
         if args.include_purchases:
-            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Orders/Received", start_dt, existing_ids, ua))
+            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Orders/Received", start_dt, existing_ids, ua, final_cookie))
         if args.include_sales:
-            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Sales/Sent", start_dt, existing_ids, ua))
+            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Sales/Sent", start_dt, existing_ids, ua, final_cookie))
 
         if new_items:
             all_rows.extend(new_items)
@@ -149,9 +160,9 @@ def run():
                 writer = csv.DictWriter(f, fieldnames=keys)
                 writer.writeheader()
                 writer.writerows(all_rows)
-            print(f"[+] Guardado con éxito en {CSV_FILE}.")
+            print(f"[+] Exportación finalizada: {len(new_items)} nuevos.")
         else:
-            print("[*] No hay nada nuevo que descargar.")
+            print("[*] Sin cambios. El CSV ya está actualizado.")
 
 if __name__ == "__main__":
     run()
