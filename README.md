@@ -47,3 +47,18 @@ python export_script.py --include-purchases
 
 ## Recuperación de Estado
 El script lee automáticamente `cardmarket_export.csv`. Si encuentra un ID de pedido que ya existe en el archivo, lo omitirá. Si en una página de Cardmarket todos los pedidos ya existen, el script se detendrá automáticamente asumiendo que ya está al día.
+
+# Cardmarket Exporter (Modo Sesión)
+
+Debido a que Cardmarket utiliza un sistema de Login basado en JavaScript/Cloudflare, el script ahora permite usar tu propia sesión del navegador.
+
+## Cómo obtener tu Cookie de Sesión:
+1. Abre Cardmarket en el navegador de tu móvil (Chrome o Kiwi Browser).
+2. Inicia sesión normalmente.
+3. En la barra de direcciones, escribe `javascript:alert(document.cookie)` (en Chrome a veces hay que escribirlo a mano porque al pegar se borra el 'javascript:').
+4. Busca el texto que dice `PHPSESSID=...` y cópialo todo.
+
+## Configuración en Termux:
+```bash
+export CM_COOKIE="PHPSESSID=tu_codigo_aqui; ..."
+python export_script.py --include-purchases
