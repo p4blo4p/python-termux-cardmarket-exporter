@@ -30,11 +30,23 @@ Herramienta ligera para exportar tus compras y ventas de Cardmarket a CSV direct
 
 ## Configuración
 Define tus credenciales de Cardmarket como variables de entorno:
-```bash
+```javascript
 export CM_USERNAME="tu_usuario"
 export CM_PASSWORD="tu_password"
 ```
 
+1. Comando Maestro
+Entra en Cardmarket desde tu móvil. Pega este código en la barra de direcciones (escribe javascript: a mano si desaparece):
+```bash
+javascript:prompt('Copia este comando para Termux:', 'export CM_COOKIE="' + document.cookie + '"\nexport CM_USER_AGENT="' + navigator.userAgent + '"')
+```
+2. Pegar en Termux
+Al aceptar el mensaje en tu móvil, te dará dos líneas de código. Cópialas y pégalas directamente en Termux. Se verá así:
+```bash
+export CM_COOKIE="PHPSESSID=...; __cf_bm=...; _cfuvid=..."
+
+export CM_USER_AGENT="Mozilla/5.0 (Linux; Android 14...)"
+```
 ## Uso
 Ejecuta el script con las opciones deseadas:
 ```bash
